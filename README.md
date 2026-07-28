@@ -126,7 +126,7 @@ This project is actively being developed and has some [known issues](https://git
 **Wayland Support (Linux):**
 
 - Limited support for Wayland display server
-- Requires [`wtype`](https://github.com/atx/wtype) or [`dotool`](https://sr.ht/~geb/dotool/) for text input to work correctly (see [Linux Notes](#linux-notes) below for installation)
+- Requires a compositor-compatible input tool such as [`wtype`](https://github.com/atx/wtype), [`dotool`](https://sr.ht/~geb/dotool/), or [`ydotool`](https://github.com/ReimuNotMoe/ydotool) (see [Linux Notes](#linux-notes) below for setup)
 
 ### Linux Notes
 
@@ -134,15 +134,16 @@ This project is actively being developed and has some [known issues](https://git
 
 For reliable text input on Linux, install the appropriate tool for your display server:
 
-| Display Server | Recommended Tool | Install Command                                    |
-| -------------- | ---------------- | -------------------------------------------------- |
-| X11            | `xdotool`        | `sudo apt install xdotool`                         |
-| Wayland        | `wtype`          | `sudo apt install wtype`                           |
-| Both           | `dotool`         | `sudo apt install dotool` (requires `input` group) |
+| Display Server         | Recommended Tool   | Install Command                                  |
+| ---------------------- | ------------------ | ------------------------------------------------ |
+| X11                    | `xdotool`          | `sudo apt install xdotool`                       |
+| Wayland (except GNOME) | `wtype`            | `sudo apt install wtype`                         |
+| GNOME Wayland / Both   | `dotool`/`ydotool` | Install with your distribution's package manager |
 
 - **X11**: Install `xdotool` for both direct typing and clipboard paste shortcuts
-- **Wayland**: Install `wtype` (preferred) or `dotool` for text input to work correctly
-- **dotool setup**: Requires adding your user to the `input` group: `sudo usermod -aG input $USER` (then log out and back in)
+- **Wayland**: Install `wtype` when your compositor supports the virtual-keyboard protocol it requires
+- **GNOME Wayland**: GNOME does not support the virtual-keyboard protocol required by `wtype`; use the uinput-based `dotool` or `ydotool` instead
+- **uinput setup**: `dotool` and `ydotool` need permission to access `/dev/uinput`; follow your distribution's udev or `input`-group setup, then log out and back in. `ydotool` also requires its `ydotoold` daemon to be running
 
 Without these tools, Handy falls back to enigo which may have limited compatibility, especially on Wayland.
 

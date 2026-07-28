@@ -4,6 +4,8 @@ use crate::settings::TypingTool;
 use crate::settings::{get_settings, AutoSubmitKey, ClipboardHandling, PasteMethod};
 use enigo::{Direction, Enigo, Key, Keyboard};
 use log::info;
+#[cfg(any(target_os = "linux", test))]
+use log::warn;
 use std::process::Command;
 use std::time::Duration;
 use tauri::{AppHandle, Manager};
@@ -11,6 +13,61 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 
 #[cfg(target_os = "linux")]
 use crate::utils::{is_kde_wayland, is_wayland};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(target_os = "linux", test))]
+enum LinuxInputTool {
+    Wtype,
+    Kwtype,
+    Dotool,
+    Ydotool,
+    Xdotool,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl LinuxInputTool {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Wtype => "wtype",
+            Self::Kwtype => "kwtype",
+            Self::Dotool => "dotool",
+            Self::Ydotool => "ydotool",
+            Self::Xdotool => "xdotool",
+        }
+    }
+}
+
+/// Runs eligible Linux input tools in order.
+///
+/// Auto mode continues after runtime failures so another native tool, or
+/// ultimately Enigo, can handle the input. Explicit selections remain
+/// fail-fast and return the selected tool's error.
+#[cfg(any(target_os = "linux", test))]
+fn try_linux_input_candidates<const N: usize>(
+    candidates: [(LinuxInputTool, bool); N],
+    continue_on_error: bool,
+    mut run: impl FnMut(LinuxInputTool) -> Result<(), String>,
+) -> Result<bool, String> {
+    for (tool, available) in candidates {
+        if !available {
+            continue;
+        }
+
+        match run(tool) {
+            Ok(()) => return Ok(true),
+            Err(error) if continue_on_error => {
+                warn!(
+                    "{} failed while injecting input: {}; trying the next fallback",
+                    tool.name(),
+                    error
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(false)
+}
 
 /// Pastes text using the clipboard: saves current content, writes text, sends paste keystroke, restores clipboard.
 fn paste_via_clipboard(
@@ -105,36 +162,49 @@ fn try_send_key_combo_linux(paste_method: &PasteMethod) -> Result<bool, String> 
     if is_wayland() {
         // Wayland: prefer wtype (but not on KDE), then dotool, then ydotool
         // Note: wtype doesn't work on KDE (no zwp_virtual_keyboard_manager_v1 support)
-        if !is_kde_wayland() && is_wtype_available() {
-            info!("Using wtype for key combo");
-            send_key_combo_via_wtype(paste_method)?;
-            return Ok(true);
-        }
-        if is_dotool_available() {
-            info!("Using dotool for key combo");
-            send_key_combo_via_dotool(paste_method)?;
-            return Ok(true);
-        }
-        if is_ydotool_available() {
-            info!("Using ydotool for key combo");
-            send_key_combo_via_ydotool(paste_method)?;
-            return Ok(true);
-        }
+        let candidates = [
+            (
+                LinuxInputTool::Wtype,
+                !is_kde_wayland() && is_wtype_available(),
+            ),
+            (LinuxInputTool::Dotool, is_dotool_available()),
+            (LinuxInputTool::Ydotool, is_ydotool_available()),
+        ];
+
+        return try_linux_input_candidates(candidates, true, |tool| match tool {
+            LinuxInputTool::Wtype => {
+                info!("Using wtype for key combo");
+                send_key_combo_via_wtype(paste_method)
+            }
+            LinuxInputTool::Dotool => {
+                info!("Using dotool for key combo");
+                send_key_combo_via_dotool(paste_method)
+            }
+            LinuxInputTool::Ydotool => {
+                info!("Using ydotool for key combo");
+                send_key_combo_via_ydotool(paste_method)
+            }
+            _ => unreachable!("unexpected Wayland key-combination tool"),
+        });
     } else {
         // X11: prefer xdotool, then ydotool
-        if is_xdotool_available() {
-            info!("Using xdotool for key combo");
-            send_key_combo_via_xdotool(paste_method)?;
-            return Ok(true);
-        }
-        if is_ydotool_available() {
-            info!("Using ydotool for key combo");
-            send_key_combo_via_ydotool(paste_method)?;
-            return Ok(true);
-        }
-    }
+        let candidates = [
+            (LinuxInputTool::Xdotool, is_xdotool_available()),
+            (LinuxInputTool::Ydotool, is_ydotool_available()),
+        ];
 
-    Ok(false)
+        return try_linux_input_candidates(candidates, true, |tool| match tool {
+            LinuxInputTool::Xdotool => {
+                info!("Using xdotool for key combo");
+                send_key_combo_via_xdotool(paste_method)
+            }
+            LinuxInputTool::Ydotool => {
+                info!("Using ydotool for key combo");
+                send_key_combo_via_ydotool(paste_method)
+            }
+            _ => unreachable!("unexpected X11 key-combination tool"),
+        });
+    }
 }
 
 /// Attempts to type text directly using Linux-native tools.
@@ -143,79 +213,72 @@ fn try_send_key_combo_linux(paste_method: &PasteMethod) -> Result<bool, String> 
 fn try_direct_typing_linux(text: &str, preferred_tool: TypingTool) -> Result<bool, String> {
     // If user specified a tool, try only that one
     if preferred_tool != TypingTool::Auto {
-        return match preferred_tool {
-            TypingTool::Wtype if is_wtype_available() => {
-                info!("Using user-specified wtype");
-                type_text_via_wtype(text)?;
-                Ok(true)
-            }
-            TypingTool::Kwtype if is_kwtype_available() => {
-                info!("Using user-specified kwtype");
-                type_text_via_kwtype(text)?;
-                Ok(true)
-            }
-            TypingTool::Dotool if is_dotool_available() => {
-                info!("Using user-specified dotool");
-                type_text_via_dotool(text)?;
-                Ok(true)
-            }
-            TypingTool::Ydotool if is_ydotool_available() => {
-                info!("Using user-specified ydotool");
-                type_text_via_ydotool(text)?;
-                Ok(true)
-            }
-            TypingTool::Xdotool if is_xdotool_available() => {
-                info!("Using user-specified xdotool");
-                type_text_via_xdotool(text)?;
-                Ok(true)
-            }
-            _ => Err(format!(
+        let (tool, available) = match preferred_tool {
+            TypingTool::Wtype => (LinuxInputTool::Wtype, is_wtype_available()),
+            TypingTool::Kwtype => (LinuxInputTool::Kwtype, is_kwtype_available()),
+            TypingTool::Dotool => (LinuxInputTool::Dotool, is_dotool_available()),
+            TypingTool::Ydotool => (LinuxInputTool::Ydotool, is_ydotool_available()),
+            TypingTool::Xdotool => (LinuxInputTool::Xdotool, is_xdotool_available()),
+            TypingTool::Auto => unreachable!("auto mode handled below"),
+        };
+
+        if !available {
+            return Err(format!(
                 "Typing tool {:?} is not available on this system",
                 preferred_tool
-            )),
-        };
+            ));
+        }
+
+        return try_linux_input_candidates([(tool, true)], false, |tool| {
+            info!("Using user-specified {}", tool.name());
+            match tool {
+                LinuxInputTool::Wtype => type_text_via_wtype(text),
+                LinuxInputTool::Kwtype => type_text_via_kwtype(text),
+                LinuxInputTool::Dotool => type_text_via_dotool(text),
+                LinuxInputTool::Ydotool => type_text_via_ydotool(text),
+                LinuxInputTool::Xdotool => type_text_via_xdotool(text),
+            }
+        });
     }
 
-    // Auto mode - existing fallback chain
+    // Auto mode - continue through the fallback chain after runtime failures.
     if is_wayland() {
-        // KDE Wayland: prefer kwtype (uses KDE Fake Input protocol, supports umlauts)
-        if is_kde_wayland() && is_kwtype_available() {
-            info!("Using kwtype for direct text input on KDE Wayland");
-            type_text_via_kwtype(text)?;
-            return Ok(true);
-        }
+        let kde_wayland = is_kde_wayland();
         // Wayland: prefer wtype, then dotool, then ydotool
         // Note: wtype doesn't work on KDE (no zwp_virtual_keyboard_manager_v1 support)
-        if !is_kde_wayland() && is_wtype_available() {
-            info!("Using wtype for direct text input");
-            type_text_via_wtype(text)?;
-            return Ok(true);
-        }
-        if is_dotool_available() {
-            info!("Using dotool for direct text input");
-            type_text_via_dotool(text)?;
-            return Ok(true);
-        }
-        if is_ydotool_available() {
-            info!("Using ydotool for direct text input");
-            type_text_via_ydotool(text)?;
-            return Ok(true);
-        }
+        let candidates = [
+            (LinuxInputTool::Kwtype, kde_wayland && is_kwtype_available()),
+            (LinuxInputTool::Wtype, !kde_wayland && is_wtype_available()),
+            (LinuxInputTool::Dotool, is_dotool_available()),
+            (LinuxInputTool::Ydotool, is_ydotool_available()),
+        ];
+
+        return try_linux_input_candidates(candidates, true, |tool| {
+            info!("Using {} for direct text input", tool.name());
+            match tool {
+                LinuxInputTool::Wtype => type_text_via_wtype(text),
+                LinuxInputTool::Kwtype => type_text_via_kwtype(text),
+                LinuxInputTool::Dotool => type_text_via_dotool(text),
+                LinuxInputTool::Ydotool => type_text_via_ydotool(text),
+                LinuxInputTool::Xdotool => unreachable!("unexpected Wayland direct input tool"),
+            }
+        });
     } else {
         // X11: prefer xdotool, then ydotool
-        if is_xdotool_available() {
-            info!("Using xdotool for direct text input");
-            type_text_via_xdotool(text)?;
-            return Ok(true);
-        }
-        if is_ydotool_available() {
-            info!("Using ydotool for direct text input");
-            type_text_via_ydotool(text)?;
-            return Ok(true);
-        }
-    }
+        let candidates = [
+            (LinuxInputTool::Xdotool, is_xdotool_available()),
+            (LinuxInputTool::Ydotool, is_ydotool_available()),
+        ];
 
-    Ok(false)
+        return try_linux_input_candidates(candidates, true, |tool| {
+            info!("Using {} for direct text input", tool.name());
+            match tool {
+                LinuxInputTool::Xdotool => type_text_via_xdotool(text),
+                LinuxInputTool::Ydotool => type_text_via_ydotool(text),
+                _ => unreachable!("unexpected X11 direct input tool"),
+            }
+        });
+    }
 }
 
 /// Returns the list of available typing tools on this system.
@@ -687,6 +750,74 @@ pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_candidates_continue_after_runtime_failure() {
+        for input_path in ["direct typing", "clipboard key combo"] {
+            let mut attempted = Vec::new();
+            let handled = try_linux_input_candidates(
+                [
+                    (LinuxInputTool::Wtype, true),
+                    (LinuxInputTool::Dotool, true),
+                    (LinuxInputTool::Ydotool, true),
+                ],
+                true,
+                |tool| {
+                    attempted.push(tool);
+                    match tool {
+                        LinuxInputTool::Wtype => Err(format!(
+                            "{input_path}: compositor does not support virtual keyboard protocol"
+                        )),
+                        LinuxInputTool::Dotool => Ok(()),
+                        _ => panic!("successful candidate should stop the chain"),
+                    }
+                },
+            )
+            .unwrap();
+
+            assert!(handled);
+            assert_eq!(
+                attempted,
+                vec![LinuxInputTool::Wtype, LinuxInputTool::Dotool]
+            );
+        }
+    }
+
+    #[test]
+    fn auto_candidates_skip_unavailable_tools_in_order() {
+        let mut attempted = Vec::new();
+        let handled = try_linux_input_candidates(
+            [
+                (LinuxInputTool::Wtype, false),
+                (LinuxInputTool::Dotool, true),
+                (LinuxInputTool::Ydotool, true),
+            ],
+            true,
+            |tool| {
+                attempted.push(tool);
+                Err("runtime failure".into())
+            },
+        )
+        .unwrap();
+
+        assert!(!handled);
+        assert_eq!(
+            attempted,
+            vec![LinuxInputTool::Dotool, LinuxInputTool::Ydotool]
+        );
+    }
+
+    #[test]
+    fn explicit_candidate_returns_runtime_error_without_fallback() {
+        let mut attempted = Vec::new();
+        let result = try_linux_input_candidates([(LinuxInputTool::Wtype, true)], false, |tool| {
+            attempted.push(tool);
+            Err("wtype protocol failure".into())
+        });
+
+        assert_eq!(result, Err("wtype protocol failure".into()));
+        assert_eq!(attempted, vec![LinuxInputTool::Wtype]);
+    }
 
     #[test]
     fn auto_submit_requires_setting_enabled() {
