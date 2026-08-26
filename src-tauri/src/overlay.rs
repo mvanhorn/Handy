@@ -301,8 +301,32 @@ fn current_overlay_logical_size(window: &tauri::webview::WebviewWindow) -> Optio
 #[cfg(target_os = "windows")]
 static WINDOWS_OVERLAY_IS_STREAMING: AtomicBool = AtomicBool::new(false);
 
-/// Overlay rectangle in the destination monitor's physical pixels, so nothing
-/// is converted through the window's previous-monitor DPI.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WindowInsets {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+/// Expands desired client-area bounds into the outer HWND bounds required by
+/// `SetWindowPos` while keeping the client area's screen origin unchanged.
+#[cfg(any(target_os = "windows", test))]
+fn outer_bounds_for_client_bounds(
+    (client_x, client_y, client_width, client_height): (i32, i32, i32, i32),
+    insets: WindowInsets,
+) -> (i32, i32, i32, i32) {
+    (
+        client_x - insets.left,
+        client_y - insets.top,
+        client_width + insets.left + insets.right,
+        client_height + insets.top + insets.bottom,
+    )
+}
+
+/// Desired overlay client rectangle in the destination monitor's physical
+/// pixels, so nothing is converted through the window's previous-monitor DPI.
 #[cfg(target_os = "windows")]
 fn windows_overlay_bounds(
     monitor_position: PhysicalPosition<i32>,
@@ -329,6 +353,45 @@ fn windows_overlay_bounds(
     (x, y, width, height)
 }
 
+#[cfg(target_os = "windows")]
+fn window_insets(hwnd: windows::Win32::Foundation::HWND) -> Result<WindowInsets, String> {
+    use windows::Win32::Foundation::{POINT, RECT};
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect};
+
+    let mut window_rect = RECT::default();
+    let mut client_rect = RECT::default();
+
+    unsafe {
+        GetWindowRect(hwnd, &mut window_rect)
+            .map_err(|error| format!("failed to get overlay window rectangle: {error}"))?;
+        GetClientRect(hwnd, &mut client_rect)
+            .map_err(|error| format!("failed to get overlay client rectangle: {error}"))?;
+    }
+
+    let mut client_origin = POINT {
+        x: client_rect.left,
+        y: client_rect.top,
+    };
+    unsafe {
+        ClientToScreen(hwnd, &mut client_origin)
+            .ok()
+            .map_err(|error| {
+                format!("failed to map overlay client origin to screen coordinates: {error}")
+            })?;
+    }
+
+    let client_width = client_rect.right - client_rect.left;
+    let client_height = client_rect.bottom - client_rect.top;
+
+    Ok(WindowInsets {
+        left: client_origin.x - window_rect.left,
+        top: client_origin.y - window_rect.top,
+        right: window_rect.right - client_origin.x - client_width,
+        bottom: window_rect.bottom - client_origin.y - client_height,
+    })
+}
+
 /// Moves and sizes the overlay in one native SetWindowPos, bypassing tao's
 /// current-DPI logical conversion that mislands cross-monitor moves.
 #[cfg(target_os = "windows")]
@@ -353,26 +416,33 @@ fn place_windows_overlay(
     let hwnd = overlay_window
         .hwnd()
         .map_err(|error| format!("failed to get overlay window handle: {error}"))?;
+    let insets = window_insets(hwnd)?;
+    let (window_x, window_y, window_width, window_height) =
+        outer_bounds_for_client_bounds((x, y, width, height), insets);
 
     unsafe {
         SetWindowPos(
             hwnd,
             None,
-            x,
-            y,
-            width,
-            height,
+            window_x,
+            window_y,
+            window_width,
+            window_height,
             SWP_NOACTIVATE | SWP_NOZORDER,
         )
         .map_err(|error| format!("failed to set overlay bounds: {error}"))?;
     }
 
     log::debug!(
-        "windows overlay bounds: x={} y={} width={} height={} scale={}",
+        "windows overlay client bounds: x={} y={} width={} height={} outer_x={} outer_y={} outer_width={} outer_height={} scale={}",
         x,
         y,
         width,
         height,
+        window_x,
+        window_y,
+        window_width,
+        window_height,
         monitor.scale_factor()
     );
     Ok(())
@@ -844,6 +914,72 @@ mod tests {
                 OverlayPosition::Bottom,
             ),
             (-1530, 1040, 500, 150)
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn window_insets_report_native_geometry_failures() {
+        let error = window_insets(windows::Win32::Foundation::HWND::default()).unwrap_err();
+
+        assert!(error.starts_with("failed to get overlay window rectangle:"));
+    }
+
+    #[test]
+    fn client_bounds_with_zero_insets_preserve_top_and_bottom_placement() {
+        let insets = WindowInsets::default();
+
+        assert_eq!(
+            outer_bounds_for_client_bounds((3648, 6, 384, 69), insets),
+            (3648, 6, 384, 69)
+        );
+        assert_eq!(
+            outer_bounds_for_client_bounds((3648, 2031, 384, 69), insets),
+            (3648, 2031, 384, 69)
+        );
+    }
+
+    #[test]
+    fn client_bounds_expand_for_asymmetric_window_insets() {
+        let insets = WindowInsets {
+            left: 8,
+            top: 3,
+            right: 10,
+            bottom: 7,
+        };
+        let outer = outer_bounds_for_client_bounds((3648, 6, 384, 69), insets);
+
+        assert_eq!(outer, (3640, 3, 402, 79));
+        assert_eq!(
+            (
+                outer.0 + insets.left,
+                outer.1 + insets.top,
+                outer.2 - insets.left - insets.right,
+                outer.3 - insets.top - insets.bottom,
+            ),
+            (3648, 6, 384, 69)
+        );
+    }
+
+    #[test]
+    fn client_bounds_expand_at_negative_monitor_coordinates() {
+        let insets = WindowInsets {
+            left: 7,
+            top: 2,
+            right: 11,
+            bottom: 5,
+        };
+        let outer = outer_bounds_for_client_bounds((-1530, -160, 500, 150), insets);
+
+        assert_eq!(outer, (-1537, -162, 518, 157));
+        assert_eq!(
+            (
+                outer.0 + insets.left,
+                outer.1 + insets.top,
+                outer.2 - insets.left - insets.right,
+                outer.3 - insets.top - insets.bottom,
+            ),
+            (-1530, -160, 500, 150)
         );
     }
 }
