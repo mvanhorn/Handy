@@ -28,6 +28,8 @@ mod utils;
 pub use cli::CliArgs;
 #[cfg(debug_assertions)]
 use specta_typescript::{BigIntExportBehavior, Typescript};
+#[cfg(target_os = "macos")]
+use tauri_specta::Event as SpectaEvent;
 use tauri_specta::{collect_commands, collect_events, Builder};
 
 use env_filter::Builder as EnvFilterBuilder;
@@ -333,8 +335,29 @@ fn initialize_core_logic(app_handle: &AppHandle) {
     // tauri-plugin-autostart elsewhere)
     autostart::apply_autostart(app_handle, settings.autostart_enabled);
 
-    // Create the recording overlay window (hidden by default)
+    // Windows and Linux keep one hidden overlay window ready for reuse. macOS
+    // creates and destroys its panel around visible sessions so no idle
+    // WKWebView remains alive.
+    #[cfg(not(target_os = "macos"))]
     utils::create_recording_overlay(app_handle);
+
+    #[cfg(target_os = "macos")]
+    {
+        let overlay_handle = app_handle.clone();
+        app_handle.listen(
+            "recording-overlay-ready",
+            move |event| match serde_json::from_str::<u64>(event.payload()) {
+                Ok(window_generation) => {
+                    overlay::recording_overlay_frontend_ready(&overlay_handle, window_generation)
+                }
+                Err(error) => log::warn!("Ignoring invalid overlay readiness payload: {error}"),
+            },
+        );
+
+        managers::transcription::StreamPhaseEvent::listen(app_handle, |event| {
+            overlay::update_recording_overlay_stream_phase(event.payload);
+        });
+    }
 }
 
 #[tauri::command]

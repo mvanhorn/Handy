@@ -1,4 +1,4 @@
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import "./RecordingOverlay.css";
@@ -64,6 +64,12 @@ const RecordingOverlay: React.FC = () => {
           smoothedLevelsRef.current = Array(16).fill(0);
           setLevels(Array(WAVE_BARS).fill(0));
           setStreamText({ committed: "", tentative: "" });
+          if (overlayState === "streaming") {
+            setPhase("listening");
+            setWorkKind("transcribing");
+            setElapsed(0);
+            setSession((s) => s + 1); // remount the card fresh for this session
+          }
         }
 
         await syncLanguageFromSettings();
@@ -80,12 +86,6 @@ const RecordingOverlay: React.FC = () => {
           // Keep the previous/default placement if settings can't be read.
         }
         setState(overlayState);
-        if (overlayState === "streaming") {
-          setPhase("listening");
-          setWorkKind("transcribing");
-          setElapsed(0);
-          setSession((s) => s + 1); // remount the card fresh for this session
-        }
         setIsVisible(true);
       });
 
@@ -120,6 +120,17 @@ const RecordingOverlay: React.FC = () => {
         setPhase(payload.phase);
         if (payload.kind) setWorkKind(payload.kind);
       });
+
+      // macOS creates this WebView on demand. Tell the backend when every
+      // listener is installed so it can safely deliver the latest pending
+      // overlay state. The generation keeps readiness from a disposed WebView
+      // from activating a later panel with the same Tauri label.
+      const overlayGeneration = (
+        window as Window & { __HANDY_OVERLAY_GENERATION__?: number }
+      ).__HANDY_OVERLAY_GENERATION__;
+      if (typeof overlayGeneration === "number") {
+        await emit("recording-overlay-ready", overlayGeneration);
+      }
 
       return () => {
         unlistenShow();

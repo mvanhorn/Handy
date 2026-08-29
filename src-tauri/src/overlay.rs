@@ -1,9 +1,20 @@
 use crate::input;
+#[cfg(target_os = "macos")]
+use crate::managers::transcription::StreamPhaseEvent;
 use crate::settings;
 use crate::settings::{OverlayPosition, OverlayStyle};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize};
+
+#[cfg(target_os = "macos")]
+use once_cell::sync::Lazy;
+
+#[cfg(target_os = "macos")]
+use std::sync::Mutex;
+
+#[cfg(target_os = "macos")]
+use tauri_specta::Event as SpectaEvent;
 
 #[cfg(not(target_os = "macos"))]
 use log::debug;
@@ -15,7 +26,9 @@ use tauri::WebviewWindowBuilder;
 use tauri::WebviewUrl;
 
 #[cfg(target_os = "macos")]
-use tauri_nspanel::{tauri_panel, CollectionBehavior, PanelBuilder, PanelLevel, StyleMask};
+use tauri_nspanel::{
+    tauri_panel, CollectionBehavior, ManagerExt, PanelBuilder, PanelLevel, StyleMask,
+};
 
 #[cfg(target_os = "linux")]
 use gtk_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
@@ -32,6 +45,128 @@ tauri_panel! {
         }
     })
 }
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Eq, PartialEq)]
+enum OverlayShowAction {
+    Create { window_generation: u64 },
+    Show(String),
+    Wait,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct OverlayLifecycle {
+    operation_generation: u64,
+    next_window_generation: u64,
+    window: Option<OverlayWindowLifecycle>,
+    pending_state: Option<String>,
+    capture_ready: bool,
+    stream_phase: Option<StreamPhaseEvent>,
+}
+
+#[cfg(target_os = "macos")]
+struct OverlayWindowLifecycle {
+    generation: u64,
+    ready: bool,
+}
+
+#[cfg(target_os = "macos")]
+struct OverlayReadyReplay {
+    state: String,
+    capture_ready: bool,
+    stream_phase: Option<StreamPhaseEvent>,
+}
+
+#[cfg(target_os = "macos")]
+impl OverlayLifecycle {
+    fn request_show(&mut self, state: &str) -> OverlayShowAction {
+        self.operation_generation += 1;
+        self.pending_state = Some(state.to_string());
+        if matches!(state, "recording" | "streaming") {
+            self.capture_ready = false;
+            self.stream_phase = None;
+        }
+
+        match self.window.as_ref() {
+            Some(window) if window.ready => match self.pending_state.take() {
+                Some(state) => OverlayShowAction::Show(state),
+                None => OverlayShowAction::Wait,
+            },
+            Some(_) => OverlayShowAction::Wait,
+            None => {
+                self.next_window_generation += 1;
+                let window_generation = self.next_window_generation;
+                self.window = Some(OverlayWindowLifecycle {
+                    generation: window_generation,
+                    ready: false,
+                });
+                OverlayShowAction::Create { window_generation }
+            }
+        }
+    }
+
+    fn frontend_ready(&mut self, window_generation: u64) -> Option<OverlayReadyReplay> {
+        let Some(window) = self.window.as_mut() else {
+            return None;
+        };
+        if window.generation != window_generation || window.ready {
+            return None;
+        }
+
+        window.ready = true;
+        self.pending_state.take().map(|state| OverlayReadyReplay {
+            state,
+            capture_ready: self.capture_ready,
+            stream_phase: self.stream_phase.clone(),
+        })
+    }
+
+    fn recording_ready(&mut self) {
+        if self.window.is_some() {
+            self.capture_ready = true;
+        }
+    }
+
+    fn update_stream_phase(&mut self, phase: StreamPhaseEvent) {
+        if self.window.is_some() {
+            self.stream_phase = Some(phase);
+        }
+    }
+
+    fn creation_failed(&mut self, window_generation: u64) {
+        if self
+            .window
+            .as_ref()
+            .is_some_and(|window| window.generation == window_generation)
+        {
+            self.window = None;
+        }
+    }
+
+    fn request_hide(&mut self) -> Option<u64> {
+        self.operation_generation += 1;
+        self.pending_state = None;
+        self.capture_ready = false;
+        self.stream_phase = None;
+        self.window.as_ref().map(|_| self.operation_generation)
+    }
+
+    fn take_window_for_disposal(&mut self, cleanup_generation: u64) -> Option<u64> {
+        if self.operation_generation != cleanup_generation {
+            return None;
+        }
+
+        self.pending_state = None;
+        self.capture_ready = false;
+        self.stream_phase = None;
+        self.window.take().map(|window| window.generation)
+    }
+}
+
+#[cfg(target_os = "macos")]
+static OVERLAY_LIFECYCLE: Lazy<Mutex<OverlayLifecycle>> =
+    Lazy::new(|| Mutex::new(OverlayLifecycle::default()));
 
 // Native overlay window sizes (logical points). One window is reused for every
 // state and resized in `show_overlay_state`; each size need only be at least as
@@ -440,9 +575,10 @@ pub fn create_recording_overlay(app_handle: &AppHandle) {
     }
 }
 
-/// Creates the recording overlay panel and keeps it hidden by default (macOS)
+/// Creates one recording overlay panel generation and keeps it hidden until
+/// its frontend listeners are ready (macOS).
 #[cfg(target_os = "macos")]
-pub fn create_recording_overlay(app_handle: &AppHandle) {
+fn create_recording_overlay(app_handle: &AppHandle, window_generation: u64) {
     if let Some((x, y)) = calculate_overlay_position(app_handle, OVERLAY_WIDTH, OVERLAY_HEIGHT) {
         // PanelBuilder creates a Tauri window then converts it to NSPanel.
         // The window remains registered, so get_webview_window() still works.
@@ -460,7 +596,14 @@ pub fn create_recording_overlay(app_handle: &AppHandle) {
             .no_activate(true)
             .corner_radius(0.0)
             .style_mask(StyleMask::empty().borderless().nonactivating_panel())
-            .with_window(|w| w.decorations(false).transparent(true).focusable(false))
+            .with_window(move |w| {
+                w.decorations(false)
+                    .transparent(true)
+                    .focusable(false)
+                    .initialization_script(format!(
+                        "window.__HANDY_OVERLAY_GENERATION__ = {window_generation};"
+                    ))
+            })
             .collection_behavior(
                 CollectionBehavior::new()
                     .can_join_all_spaces()
@@ -473,8 +616,17 @@ pub fn create_recording_overlay(app_handle: &AppHandle) {
             }
             Err(e) => {
                 log::error!("Failed to create recording overlay panel: {}", e);
+                OVERLAY_LIFECYCLE
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .creation_failed(window_generation);
             }
         }
+    } else {
+        OVERLAY_LIFECYCLE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .creation_failed(window_generation);
     }
 }
 
@@ -501,13 +653,34 @@ fn show_overlay_state(app_handle: &AppHandle, state: &str) {
 }
 
 fn show_overlay_state_on_main(app_handle: &AppHandle, state: &str) {
-    // Size the overlay for this state (compact vs. streaming), then position it.
-    let (width, height) = overlay_dimensions(state);
-    if let Some(overlay_window) = app_handle.get_webview_window("recording_overlay") {
+    #[cfg(target_os = "macos")]
+    {
+        let action = OVERLAY_LIFECYCLE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .request_show(state);
+        match action {
+            OverlayShowAction::Create { window_generation } => {
+                create_recording_overlay(app_handle, window_generation)
+            }
+            OverlayShowAction::Show(state) => show_existing_overlay_on_main(app_handle, &state),
+            OverlayShowAction::Wait => {}
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
         // Invalidate any delayed hide still in flight from a previous session
         // (see `hide_recording_overlay`).
         OVERLAY_SHOW_GENERATION.fetch_add(1, Ordering::SeqCst);
+        show_existing_overlay_on_main(app_handle, state);
+    }
+}
 
+fn show_existing_overlay_on_main(app_handle: &AppHandle, state: &str) {
+    // Size the overlay for this state (compact vs. streaming), then position it.
+    let (width, height) = overlay_dimensions(state);
+    if let Some(overlay_window) = app_handle.get_webview_window("recording_overlay") {
         #[cfg(target_os = "linux")]
         let shown_with_layer_shell = if LAYER_SHELL_ACTIVE.load(Ordering::SeqCst) {
             let position = settings::get_settings(app_handle).overlay_position;
@@ -586,6 +759,36 @@ fn show_overlay_state_on_main(app_handle: &AppHandle, state: &str) {
     }
 }
 
+/// Completes the macOS overlay readiness handshake for a specific WebView
+/// generation. Stale generations and duplicate readiness events are ignored.
+#[cfg(target_os = "macos")]
+pub fn recording_overlay_frontend_ready(app_handle: &AppHandle, window_generation: u64) {
+    let handle = app_handle.clone();
+    let _ = app_handle.run_on_main_thread(move || {
+        let replay = OVERLAY_LIFECYCLE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .frontend_ready(window_generation);
+        if let Some(replay) = replay {
+            show_existing_overlay_on_main(&handle, &replay.state);
+            if replay.capture_ready {
+                let _ = handle.emit_to("recording_overlay", "recording-ready", ());
+            }
+            if let Some(phase) = replay.stream_phase {
+                let _ = phase.emit_to(&handle, "recording_overlay");
+            }
+        }
+    });
+}
+
+#[cfg(target_os = "macos")]
+pub fn update_recording_overlay_stream_phase(phase: StreamPhaseEvent) {
+    OVERLAY_LIFECYCLE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .update_stream_phase(phase);
+}
+
 /// Notify the visible recording overlay that the input stream has delivered its
 /// first sample chunk. Audio feedback uses the same backend readiness signal,
 /// but this targeted event is skipped when overlays are disabled.
@@ -599,6 +802,12 @@ pub fn emit_recording_ready(app_handle: &AppHandle) {
     // and then get reset back to the arming state by the frontend.
     let handle = app_handle.clone();
     let _ = app_handle.run_on_main_thread(move || {
+        #[cfg(target_os = "macos")]
+        OVERLAY_LIFECYCLE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .recording_ready();
+
         let _ = handle.emit_to("recording_overlay", "recording-ready", ());
     });
 }
@@ -676,10 +885,65 @@ fn update_overlay_position_on_main(app_handle: &AppHandle) {
 /// take down the overlay of a session that started in the meantime — e.g. a
 /// press the coordinator remembered while the pipeline was busy and started
 /// the instant it drained, well inside the 300 ms hide delay.
+#[cfg(not(target_os = "macos"))]
 static OVERLAY_SHOW_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Hides the recording overlay window with fade-out animation
 pub fn hide_recording_overlay(app_handle: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    hide_recording_overlay_macos(app_handle);
+
+    #[cfg(not(target_os = "macos"))]
+    hide_recording_overlay_non_macos(app_handle);
+}
+
+#[cfg(target_os = "macos")]
+fn hide_recording_overlay_macos(app_handle: &AppHandle) {
+    let cleanup_generation = OVERLAY_LIFECYCLE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .request_hide();
+    let Some(cleanup_generation) = cleanup_generation else {
+        return;
+    };
+
+    if let Some(overlay_window) = app_handle.get_webview_window("recording_overlay") {
+        let _ = overlay_window.emit("hide-overlay", ());
+    }
+
+    let handle = app_handle.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let main_handle = handle.clone();
+        let _ = handle.run_on_main_thread(move || {
+            let window_generation = OVERLAY_LIFECYCLE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take_window_for_disposal(cleanup_generation);
+            let Some(window_generation) = window_generation else {
+                log::debug!("Skipping stale overlay disposal: a newer overlay action occurred");
+                return;
+            };
+
+            // tauri-nspanel retains the converted window independently of
+            // Tauri's window registry. Remove that reference before destroying
+            // the WebviewWindow so no hidden WKWebView survives while idle.
+            main_handle.remove_webview_panel("recording_overlay");
+            if let Some(overlay_window) = main_handle.get_webview_window("recording_overlay") {
+                if let Err(error) = overlay_window.destroy() {
+                    log::error!(
+                        "Failed to destroy recording overlay generation {}: {}",
+                        window_generation,
+                        error
+                    );
+                }
+            }
+        });
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn hide_recording_overlay_non_macos(app_handle: &AppHandle) {
     // Always hide the overlay regardless of settings - if setting was changed while recording,
     // we still want to hide it properly
     if let Some(overlay_window) = app_handle.get_webview_window("recording_overlay") {
@@ -762,6 +1026,123 @@ pub fn emit_levels(app_handle: &AppHandle, levels: &[f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_overlay_waits_for_readiness_and_shows_latest_state_once() {
+        let mut lifecycle = OverlayLifecycle::default();
+
+        assert_eq!(
+            lifecycle.request_show("recording"),
+            OverlayShowAction::Create {
+                window_generation: 1
+            }
+        );
+        assert_eq!(
+            lifecycle.request_show("transcribing"),
+            OverlayShowAction::Wait
+        );
+        let replay = lifecycle.frontend_ready(1).unwrap();
+        assert_eq!(replay.state, "transcribing");
+        assert!(!replay.capture_ready);
+        assert!(replay.stream_phase.is_none());
+        assert!(lifecycle.frontend_ready(1).is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_overlay_replays_transient_state_after_readiness() {
+        let mut lifecycle = OverlayLifecycle::default();
+
+        assert!(matches!(
+            lifecycle.request_show("streaming"),
+            OverlayShowAction::Create { .. }
+        ));
+        lifecycle.recording_ready();
+        lifecycle.update_stream_phase(StreamPhaseEvent {
+            phase: crate::managers::transcription::StreamPhase::Working,
+            kind: Some(crate::managers::transcription::StreamWorkKind::Transcribing),
+        });
+
+        let replay = lifecycle.frontend_ready(1).unwrap();
+        assert_eq!(replay.state, "streaming");
+        assert!(replay.capture_ready);
+        let phase = replay.stream_phase.unwrap();
+        assert_eq!(
+            phase.phase,
+            crate::managers::transcription::StreamPhase::Working
+        );
+        assert_eq!(
+            phase.kind,
+            Some(crate::managers::transcription::StreamWorkKind::Transcribing)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_overlay_hide_before_readiness_prevents_stale_show() {
+        let mut lifecycle = OverlayLifecycle::default();
+
+        assert!(matches!(
+            lifecycle.request_show("recording"),
+            OverlayShowAction::Create { .. }
+        ));
+        let cleanup_generation = lifecycle.request_hide().unwrap();
+
+        assert!(lifecycle.frontend_ready(1).is_none());
+        assert_eq!(
+            lifecycle.take_window_for_disposal(cleanup_generation),
+            Some(1)
+        );
+        assert!(lifecycle.window.is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_overlay_new_show_invalidates_delayed_disposal() {
+        let mut lifecycle = OverlayLifecycle::default();
+
+        assert!(matches!(
+            lifecycle.request_show("recording"),
+            OverlayShowAction::Create { .. }
+        ));
+        assert!(lifecycle.frontend_ready(1).is_some());
+        let cleanup_generation = lifecycle.request_hide().unwrap();
+
+        assert_eq!(
+            lifecycle.request_show("streaming"),
+            OverlayShowAction::Show("streaming".to_string())
+        );
+        assert_eq!(lifecycle.take_window_for_disposal(cleanup_generation), None);
+        assert!(lifecycle.window.is_some());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_overlay_recreates_with_a_new_window_generation() {
+        let mut lifecycle = OverlayLifecycle::default();
+
+        assert!(matches!(
+            lifecycle.request_show("recording"),
+            OverlayShowAction::Create {
+                window_generation: 1
+            }
+        ));
+        let cleanup_generation = lifecycle.request_hide().unwrap();
+        assert_eq!(
+            lifecycle.take_window_for_disposal(cleanup_generation),
+            Some(1)
+        );
+
+        assert_eq!(
+            lifecycle.request_show("recording"),
+            OverlayShowAction::Create {
+                window_generation: 2
+            }
+        );
+        assert!(lifecycle.frontend_ready(1).is_none());
+        assert!(lifecycle.frontend_ready(2).is_some());
+    }
 
     #[test]
     fn monitor_hit_test_uses_half_open_physical_bounds() {
