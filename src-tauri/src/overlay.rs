@@ -329,8 +329,72 @@ fn windows_overlay_bounds(
     (x, y, width, height)
 }
 
-/// Moves and sizes the overlay in one native SetWindowPos, bypassing tao's
-/// current-DPI logical conversion that mislands cross-monitor moves.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WindowInsets {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+/// Expands desired client bounds into the outer bounds expected by SetWindowPos.
+#[cfg(any(target_os = "windows", test))]
+fn windows_outer_bounds(
+    (x, y, width, height): (i32, i32, i32, i32),
+    insets: WindowInsets,
+) -> (i32, i32, i32, i32) {
+    (
+        x - insets.left,
+        y - insets.top,
+        width + insets.left + insets.right,
+        height + insets.top + insets.bottom,
+    )
+}
+
+/// Measures the client rectangle's offsets within the native outer window.
+#[cfg(target_os = "windows")]
+fn windows_window_insets(hwnd: windows::Win32::Foundation::HWND) -> Result<WindowInsets, String> {
+    use windows::Win32::Foundation::{POINT, RECT};
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect};
+
+    let mut client_rect = RECT::default();
+    let mut window_rect = RECT::default();
+
+    unsafe {
+        GetClientRect(hwnd, &mut client_rect)
+            .map_err(|error| format!("failed to get overlay client bounds: {error}"))?;
+        GetWindowRect(hwnd, &mut window_rect)
+            .map_err(|error| format!("failed to get overlay outer bounds: {error}"))?;
+    }
+
+    let mut client_top_left = POINT {
+        x: client_rect.left,
+        y: client_rect.top,
+    };
+
+    unsafe {
+        ClientToScreen(hwnd, &mut client_top_left)
+            .ok()
+            .map_err(|error| format!("failed to map overlay client origin: {error}"))?;
+    }
+
+    let left = client_top_left.x - window_rect.left;
+    let top = client_top_left.y - window_rect.top;
+
+    Ok(WindowInsets {
+        left,
+        top,
+        right: window_rect.right - window_rect.left - left - (client_rect.right - client_rect.left),
+        bottom: window_rect.bottom - window_rect.top - top - (client_rect.bottom - client_rect.top),
+    })
+}
+
+/// Moves and sizes the overlay with native SetWindowPos, bypassing tao's
+/// current-DPI logical conversion that mislands cross-monitor moves. SetWindowPos
+/// consumes outer bounds, so the desired WebView client bounds are compensated
+/// for the window's measured non-client insets.
 #[cfg(target_os = "windows")]
 fn place_windows_overlay(
     app_handle: &AppHandle,
@@ -342,7 +406,7 @@ fn place_windows_overlay(
 
     let monitor = get_monitor_with_cursor(app_handle)
         .ok_or_else(|| "failed to determine the monitor containing the cursor".to_string())?;
-    let (x, y, width, height) = windows_overlay_bounds(
+    let client_bounds = windows_overlay_bounds(
         *monitor.position(),
         *monitor.size(),
         monitor.scale_factor(),
@@ -353,6 +417,8 @@ fn place_windows_overlay(
     let hwnd = overlay_window
         .hwnd()
         .map_err(|error| format!("failed to get overlay window handle: {error}"))?;
+    let initial_insets = windows_window_insets(hwnd)?;
+    let (x, y, width, height) = windows_outer_bounds(client_bounds, initial_insets);
 
     unsafe {
         SetWindowPos(
@@ -367,12 +433,39 @@ fn place_windows_overlay(
         .map_err(|error| format!("failed to set overlay bounds: {error}"))?;
     }
 
+    // The move can cross a DPI boundary, changing the non-client metrics used
+    // above. Measure again on the destination monitor and reapply the desired
+    // client bounds with the destination-DPI insets.
+    let insets = windows_window_insets(hwnd)?;
+    let (x, y, width, height) = windows_outer_bounds(client_bounds, insets);
+
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            None,
+            x,
+            y,
+            width,
+            height,
+            SWP_NOACTIVATE | SWP_NOZORDER,
+        )
+        .map_err(|error| format!("failed to reapply overlay bounds: {error}"))?;
+    }
+
     log::debug!(
-        "windows overlay bounds: x={} y={} width={} height={} scale={}",
+        "windows overlay bounds: client=({}, {}, {}x{}) outer=({}, {}, {}x{}) insets=({}, {}, {}, {}) scale={}",
+        client_bounds.0,
+        client_bounds.1,
+        client_bounds.2,
+        client_bounds.3,
         x,
         y,
         width,
         height,
+        insets.left,
+        insets.top,
+        insets.right,
+        insets.bottom,
         monitor.scale_factor()
     );
     Ok(())
@@ -844,6 +937,62 @@ mod tests {
                 OverlayPosition::Bottom,
             ),
             (-1530, 1040, 500, 150)
+        );
+    }
+
+    #[test]
+    fn windows_outer_bounds_preserve_client_bounds_without_insets() {
+        let client_bounds = (832, 4, 256, 46);
+
+        assert_eq!(
+            windows_outer_bounds(client_bounds, WindowInsets::default()),
+            client_bounds
+        );
+    }
+
+    #[test]
+    fn windows_outer_bounds_preserve_top_positioned_client_with_asymmetric_insets() {
+        let client_bounds = (832, 4, 256, 46);
+        let insets = WindowInsets {
+            left: 7,
+            top: 3,
+            right: 9,
+            bottom: 5,
+        };
+        let outer_bounds = windows_outer_bounds(client_bounds, insets);
+
+        assert_eq!(outer_bounds, (825, 1, 272, 54));
+        assert_eq!(
+            (
+                outer_bounds.0 + insets.left,
+                outer_bounds.1 + insets.top,
+                outer_bounds.2 - insets.left - insets.right,
+                outer_bounds.3 - insets.top - insets.bottom,
+            ),
+            client_bounds
+        );
+    }
+
+    #[test]
+    fn windows_outer_bounds_preserve_bottom_positioned_client_with_asymmetric_insets() {
+        let client_bounds = (832, 994, 256, 46);
+        let insets = WindowInsets {
+            left: 7,
+            top: 3,
+            right: 9,
+            bottom: 5,
+        };
+        let outer_bounds = windows_outer_bounds(client_bounds, insets);
+
+        assert_eq!(outer_bounds, (825, 991, 272, 54));
+        assert_eq!(
+            (
+                outer_bounds.0 + insets.left,
+                outer_bounds.1 + insets.top,
+                outer_bounds.2 - insets.left - insets.right,
+                outer_bounds.3 - insets.top - insets.bottom,
+            ),
+            client_bounds
         );
     }
 }
