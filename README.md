@@ -151,7 +151,7 @@ For reliable text input on Linux, install the appropriate tool for your display 
 | Both           | `dotool`         | `sudo apt install dotool` (requires `input` group) |
 
 - **X11**: Install `xdotool` for both direct typing and clipboard paste shortcuts
-- **Ubuntu 26.04**: Has Wayland display server by default. `wtype` does not work, you need to install `ydotool` and configure systemd as described [here](https://github.com/cjpais/Handy/pull/557#issuecomment-3781249267).
+- **Ubuntu 26.04**: Has Wayland display server by default. `wtype` does not work, you need to install `ydotool` and configure systemd as described [here](https://github.com/cjpais/Handy/pull/557#issuecomment-3781249267). Handy searches for the ydotoold socket in this order: the inherited `YDOTOOL_SOCKET` variable, then `$XDG_RUNTIME_DIR/.ydotool_socket`, then `/tmp/.ydotool_socket`. A system `ydotoold` socket must be writable by the desktop user (`ydotoold --socket-own=<uid>:<gid>` or an equivalent unit drop-in).
 - **Wayland**: Install `wtype` (preferred) or `dotool` for text input to work correctly
 - **dotool setup**: Requires adding your user to the `input` group: `sudo usermod -aG input $USER` (then log out and back in)
 

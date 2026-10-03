@@ -317,6 +317,295 @@ fn classify_ydotool_key_syntax(help: &str) -> Option<YdotoolKeySyntax> {
     }
 }
 
+/// Metadata for one ydotoold socket candidate. `mode` may include file-type bits;
+/// writability uses only the permission bits.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug)]
+struct YdotoolSocketMeta {
+    is_socket: bool,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+}
+
+/// A path Handy may pass to the ydotool client. `meta` is `None` when the path
+/// does not exist or cannot be statted.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+struct YdotoolSocketCandidate {
+    path: String,
+    meta: Option<YdotoolSocketMeta>,
+}
+
+/// How the ydotool child should see `YDOTOOL_SOCKET`.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum YdotoolSocketSelection {
+    /// A non-empty variable is already in the environment. Do not replace it.
+    Inherit(String),
+    /// Set `YDOTOOL_SOCKET` on this child only.
+    Inject(String),
+    /// No usable candidate. Leave the client default alone.
+    ClientDefault,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+struct YdotoolSocketResolution {
+    selection: YdotoolSocketSelection,
+    /// Search-order notes for every candidate, included in paste failures.
+    checked: Vec<String>,
+}
+
+#[cfg(target_os = "linux")]
+fn current_euid() -> u32 {
+    // SAFETY: geteuid only reads the calling process's credential.
+    unsafe { libc::geteuid() as u32 }
+}
+
+#[cfg(target_os = "linux")]
+fn current_egid() -> u32 {
+    // SAFETY: getegid only reads the calling process's credential.
+    unsafe { libc::getegid() as u32 }
+}
+
+/// Supplementary groups only. The effective gid is not included unless the
+/// platform already reports it here; callers check `getegid` separately.
+#[cfg(target_os = "linux")]
+fn supplementary_group_ids() -> Vec<u32> {
+    let mut groups: Vec<libc::gid_t> = vec![0; 32];
+    loop {
+        // SAFETY: `groups` is a writable `gid_t` buffer and its length is the
+        // `ngroups` argument. A negative return is an error code, not a count.
+        let result = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
+        if result >= 0 {
+            groups.truncate(result as usize);
+            return groups.into_iter().map(|gid| gid as u32).collect();
+        }
+        let err = std::io::Error::last_os_error().raw_os_error();
+        if err == Some(libc::EINVAL) && groups.len() < 65_536 {
+            groups.resize(groups.len().saturating_mul(2), 0);
+            continue;
+        }
+        return Vec::new();
+    }
+}
+
+/// Unix DAC write check used by `connect()`. Exactly one class applies: root,
+/// owner write, group write for `getegid` or a supplementary group, or other
+/// write. A caller already in the socket's group is not granted other-write,
+/// so a mode such as `0606` is not writable for that caller.
+#[cfg(target_os = "linux")]
+fn socket_writable_by_current_user(meta: &YdotoolSocketMeta) -> bool {
+    let mode = meta.mode & 0o777;
+    let euid = current_euid();
+    if euid == 0 {
+        return true;
+    }
+    if euid == meta.uid {
+        return mode & 0o200 != 0;
+    }
+    if current_egid() == meta.gid || supplementary_group_ids().contains(&meta.gid) {
+        return mode & 0o020 != 0;
+    }
+    mode & 0o002 != 0
+}
+
+#[cfg(target_os = "linux")]
+fn describe_ydotool_candidate(candidate: &YdotoolSocketCandidate) -> String {
+    let Some(meta) = candidate.meta else {
+        return format!("{}: not found", candidate.path);
+    };
+    let mode = meta.mode & 0o777;
+    if !meta.is_socket {
+        return format!(
+            "{}: not a socket (mode {:04o} owner uid {} gid {})",
+            candidate.path, mode, meta.uid, meta.gid
+        );
+    }
+    if socket_writable_by_current_user(&meta) {
+        return format!(
+            "{}: writable socket mode {:04o} owner uid {} gid {}",
+            candidate.path, mode, meta.uid, meta.gid
+        );
+    }
+    format!(
+        "{}: socket mode {:04o} owner uid {} gid {} is not writable by the desktop user",
+        candidate.path, mode, meta.uid, meta.gid
+    )
+}
+
+/// Picks the socket for one ydotool child.
+///
+/// A non-empty `YDOTOOL_SOCKET` wins and is not rewritten. Blank values fall
+/// through to the candidates in order. The first existing writable socket is
+/// injected; otherwise the client default is left in place. Candidates are
+/// described either way so a later non-zero exit can name what was checked.
+#[cfg(target_os = "linux")]
+fn select_ydotool_socket(
+    inherited: Option<&str>,
+    candidates: &[YdotoolSocketCandidate],
+) -> YdotoolSocketResolution {
+    let mut injectable = None;
+    let mut checked = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let writable_socket = candidate
+            .meta
+            .is_some_and(|meta| meta.is_socket && socket_writable_by_current_user(&meta));
+        if writable_socket && injectable.is_none() {
+            injectable = Some(candidate.path.clone());
+        }
+        checked.push(describe_ydotool_candidate(candidate));
+    }
+
+    if let Some(value) = inherited.filter(|value| !value.trim().is_empty()) {
+        return YdotoolSocketResolution {
+            selection: YdotoolSocketSelection::Inherit(value.to_string()),
+            checked,
+        };
+    }
+
+    if let Some(path) = injectable {
+        return YdotoolSocketResolution {
+            selection: YdotoolSocketSelection::Inject(path),
+            checked,
+        };
+    }
+
+    YdotoolSocketResolution {
+        selection: YdotoolSocketSelection::ClientDefault,
+        checked,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn stat_ydotool_socket_candidate(path: std::path::PathBuf) -> YdotoolSocketCandidate {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let path_string = path.display().to_string();
+    let meta = match std::fs::metadata(&path) {
+        Ok(metadata) => Some(YdotoolSocketMeta {
+            is_socket: metadata.file_type().is_socket(),
+            mode: metadata.mode(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        }),
+        Err(_) => None,
+    };
+    YdotoolSocketCandidate {
+        path: path_string,
+        meta,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn runtime_ydotool_socket_candidate() -> YdotoolSocketCandidate {
+    match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(dir) if !dir.is_empty() => {
+            let mut path = std::path::PathBuf::from(dir);
+            path.push(".ydotool_socket");
+            stat_ydotool_socket_candidate(path)
+        }
+        _ => YdotoolSocketCandidate {
+            path: "$XDG_RUNTIME_DIR/.ydotool_socket".to_string(),
+            meta: None,
+        },
+    }
+}
+
+/// Stats the socket search path on every call. Nothing here is cached: a
+/// daemon restarted between pastes has to be visible to the next child.
+#[cfg(target_os = "linux")]
+fn resolve_ydotool_socket() -> YdotoolSocketResolution {
+    // `var_os` keeps a non-Unicode value inherited. Blank (empty or
+    // whitespace) is treated as unset and falls through inside the selector.
+    let inherited =
+        std::env::var_os("YDOTOOL_SOCKET").map(|value| value.to_string_lossy().into_owned());
+    let candidates = [
+        runtime_ydotool_socket_candidate(),
+        stat_ydotool_socket_candidate(std::path::PathBuf::from("/tmp/.ydotool_socket")),
+    ];
+    select_ydotool_socket(inherited.as_deref(), &candidates)
+}
+
+/// Applies a socket selection to a ydotool child. Inherit leaves a non-empty
+/// `YDOTOOL_SOCKET` untouched. Inject sets it on this child only.
+/// ClientDefault removes it so an empty or whitespace value is not inherited:
+/// ydotool 1.0.4 treats any set value as the socket path.
+#[cfg(target_os = "linux")]
+fn configure_ydotool_socket(command: &mut Command, resolution: &YdotoolSocketResolution) {
+    match &resolution.selection {
+        YdotoolSocketSelection::Inject(path) => {
+            command.env("YDOTOOL_SOCKET", path);
+        }
+        YdotoolSocketSelection::ClientDefault => {
+            command.env_remove("YDOTOOL_SOCKET");
+        }
+        YdotoolSocketSelection::Inherit(_) => {}
+    }
+}
+
+/// Builds a `ydotool` command with the socket resolved for this child only.
+#[cfg(target_os = "linux")]
+fn ydotool_command() -> (Command, YdotoolSocketResolution) {
+    let resolution = resolve_ydotool_socket();
+    let mut command = Command::new("ydotool");
+    configure_ydotool_socket(&mut command, &resolution);
+    (command, resolution)
+}
+
+/// Failure text for a non-zero ydotool exit. Stdout, stderr, and the status
+/// are always included, then the socket decision and every path that was
+/// checked, so the paste error is never the bare `ydotool failed:`.
+#[cfg(target_os = "linux")]
+fn format_ydotool_failure(
+    stdout: &str,
+    stderr: &str,
+    exit_code: Option<i32>,
+    resolution: &YdotoolSocketResolution,
+) -> String {
+    let status = match exit_code {
+        Some(code) => format!("exit status {}", code),
+        None => "exit status unavailable".to_string(),
+    };
+    let stdout_text = if stdout.is_empty() { "(empty)" } else { stdout };
+    let stderr_text = if stderr.is_empty() { "(empty)" } else { stderr };
+    let socket = match &resolution.selection {
+        YdotoolSocketSelection::Inherit(path) => format!("inherited YDOTOOL_SOCKET={}", path),
+        YdotoolSocketSelection::Inject(path) => format!("injected YDOTOOL_SOCKET={}", path),
+        YdotoolSocketSelection::ClientDefault => {
+            "YDOTOOL_SOCKET left unset for the ydotool client default".to_string()
+        }
+    };
+    let checked = if resolution.checked.is_empty() {
+        "(none)".to_string()
+    } else {
+        resolution.checked.join("; ")
+    };
+    format!(
+        "ydotool failed: {}; stdout: {}; stderr: {}; {}; paths checked: {}",
+        status, stdout_text, stderr_text, socket, checked
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn check_ydotool_output(
+    output: std::process::Output,
+    resolution: &YdotoolSocketResolution,
+) -> Result<(), String> {
+    if output.status.success() {
+        return Ok(());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format_ydotool_failure(
+        &stdout,
+        &stderr,
+        output.status.code(),
+        resolution,
+    ))
+}
+
 /// Detects and caches a recognized ydotool key syntax. Unknown or failed probes are not cached,
 /// allowing a transient daemon or PATH problem to recover on a later paste attempt.
 #[cfg(target_os = "linux")]
@@ -325,7 +614,8 @@ fn detect_ydotool_key_syntax() -> YdotoolKeySyntax {
         return *syntax;
     }
 
-    match Command::new("ydotool").args(["key", "--help"]).output() {
+    let (mut command, _resolution) = ydotool_command();
+    match command.args(["key", "--help"]).output() {
         Ok(output) => {
             // ydotool 0.x writes help to stderr and its exit status varies by build.
             let mut help = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -506,19 +796,15 @@ fn type_text_via_dotool(text: &str) -> Result<(), String> {
 /// Type text directly via ydotool (uinput-based, requires ydotoold daemon).
 #[cfg(target_os = "linux")]
 fn type_text_via_ydotool(text: &str) -> Result<(), String> {
-    let output = Command::new("ydotool")
+    let (mut command, resolution) = ydotool_command();
+    let output = command
         .arg("type")
         .arg("--")
         .arg(text)
         .output()
         .map_err(|e| format!("Failed to execute ydotool: {}", e))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ydotool failed: {}", stderr));
-    }
-
-    Ok(())
+    check_ydotool_output(output, &resolution)
 }
 
 /// Type text directly via kwtype (KDE Wayland virtual keyboard, uses KDE Fake Input protocol).
@@ -639,17 +925,13 @@ fn send_key_combo_via_ydotool(paste_method: &PasteMethod) -> Result<(), String> 
     let syntax = detect_ydotool_key_syntax();
     let args = ydotool_key_args(paste_method, syntax)?;
 
-    let output = Command::new("ydotool")
+    let (mut command, resolution) = ydotool_command();
+    let output = command
         .args(args)
         .output()
         .map_err(|e| format!("Failed to execute ydotool: {}", e))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ydotool failed: {}", stderr));
-    }
-
-    Ok(())
+    check_ydotool_output(output, &resolution)
 }
 
 /// Send a key combination (e.g., Ctrl+V) via xdotool on X11.
@@ -943,6 +1225,389 @@ e.g. 28:1 28:0 means pressing on the Enter button on a standard US keyboard.
             ydotool_key_args(&PasteMethod::ShiftInsert, YdotoolKeySyntax::RawKeycodes).unwrap(),
             ["key", "42:1", "110:1", "110:0", "42:0"]
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn candidate(path: &str, meta: Option<YdotoolSocketMeta>) -> YdotoolSocketCandidate {
+        YdotoolSocketCandidate {
+            path: path.to_string(),
+            meta,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn accessible_socket(path: &str) -> YdotoolSocketCandidate {
+        candidate(
+            path,
+            Some(YdotoolSocketMeta {
+                is_socket: true,
+                mode: 0o600,
+                uid: current_euid(),
+                gid: current_egid(),
+            }),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn child_socket(command: &Command) -> Option<&std::ffi::OsStr> {
+        command
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("YDOTOOL_SOCKET"))
+            .and_then(|(_, value)| value)
+    }
+
+    // `env_remove` records the key with a None value. An absent entry still
+    // inherits whatever the parent process has set.
+    #[cfg(target_os = "linux")]
+    fn ydotool_socket_was_removed(command: &Command) -> bool {
+        command
+            .get_envs()
+            .any(|(key, value)| key == std::ffi::OsStr::new("YDOTOOL_SOCKET") && value.is_none())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inherited_ydotool_socket_is_not_replaced() {
+        let inherited = "/run/user/1000/.ydotool_socket";
+        let resolution = select_ydotool_socket(
+            Some(inherited),
+            &[
+                accessible_socket("/run/user/1000/.ydotool_socket"),
+                accessible_socket("/tmp/.ydotool_socket"),
+            ],
+        );
+
+        assert_eq!(
+            resolution.selection,
+            YdotoolSocketSelection::Inherit(inherited.to_string())
+        );
+        let mut command = Command::new("ydotool");
+        configure_ydotool_socket(&mut command, &resolution);
+        assert!(
+            command
+                .get_envs()
+                .all(|(key, _)| key != std::ffi::OsStr::new("YDOTOOL_SOCKET")),
+            "a non-empty inherited YDOTOOL_SOCKET must be left untouched"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fedora_tmp_socket_is_injected_when_runtime_socket_is_absent() {
+        let resolution = select_ydotool_socket(
+            None,
+            &[
+                candidate("/run/user/1000/.ydotool_socket", None),
+                accessible_socket("/tmp/.ydotool_socket"),
+            ],
+        );
+
+        assert_eq!(
+            resolution.selection,
+            YdotoolSocketSelection::Inject("/tmp/.ydotool_socket".to_string())
+        );
+        let mut command = Command::new("ydotool");
+        configure_ydotool_socket(&mut command, &resolution);
+        assert_eq!(
+            child_socket(&command),
+            Some(std::ffi::OsStr::new("/tmp/.ydotool_socket"))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_dir_socket_wins_when_both_exist() {
+        let resolution = select_ydotool_socket(
+            None,
+            &[
+                accessible_socket("/run/user/1000/.ydotool_socket"),
+                accessible_socket("/tmp/.ydotool_socket"),
+            ],
+        );
+
+        assert_eq!(
+            resolution.selection,
+            YdotoolSocketSelection::Inject("/run/user/1000/.ydotool_socket".to_string())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inaccessible_daemon_socket_is_left_for_the_client_default() {
+        let euid = current_euid();
+        assert_ne!(euid, 0, "this fixture assumes a non-root desktop user");
+        let owner = euid.wrapping_add(1);
+        let resolution = select_ydotool_socket(
+            None,
+            &[
+                candidate("/run/user/1000/.ydotool_socket", None),
+                candidate(
+                    "/tmp/.ydotool_socket",
+                    Some(YdotoolSocketMeta {
+                        is_socket: true,
+                        mode: 0o600,
+                        uid: owner,
+                        gid: owner,
+                    }),
+                ),
+            ],
+        );
+
+        assert_eq!(resolution.selection, YdotoolSocketSelection::ClientDefault);
+        let mut command = Command::new("ydotool");
+        configure_ydotool_socket(&mut command, &resolution);
+        assert!(
+            ydotool_socket_was_removed(&command),
+            "client default must clear YDOTOOL_SOCKET rather than inherit it"
+        );
+
+        let failure = format_ydotool_failure("", "", Some(1), &resolution);
+        assert!(failure.contains("/tmp/.ydotool_socket"));
+        assert!(failure.contains("0600"));
+        assert!(failure.contains(&format!("owner uid {}", owner)));
+        assert!(failure.contains("client default"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn empty_ydotool_output_includes_status_and_paths_checked() {
+        let resolution = select_ydotool_socket(
+            None,
+            &[
+                candidate("/run/user/1000/.ydotool_socket", None),
+                candidate("/tmp/.ydotool_socket", None),
+            ],
+        );
+        let failure = format_ydotool_failure("", "", Some(2), &resolution);
+
+        assert!(failure.contains("exit status 2"));
+        assert!(failure.contains("/run/user/1000/.ydotool_socket"));
+        assert!(failure.contains("/tmp/.ydotool_socket"));
+        assert!(failure.contains("paths checked"));
+        assert_ne!(failure, "ydotool failed:");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ydotool_connect_error_is_preserved_with_candidate_notes() {
+        let stderr =
+            "failed to connect socket '/run/user/1000/.ydotool_socket': No such file or directory";
+        let resolution = select_ydotool_socket(
+            None,
+            &[
+                candidate("/run/user/1000/.ydotool_socket", None),
+                candidate("/tmp/.ydotool_socket", None),
+            ],
+        );
+        let failure = format_ydotool_failure("", stderr, Some(1), &resolution);
+
+        let stderr_at = failure.find(stderr).expect("stderr should be preserved");
+        let notes_at = failure
+            .find("paths checked")
+            .expect("candidate notes should be appended");
+        assert!(stderr_at < notes_at);
+        assert!(failure.contains("/tmp/.ydotool_socket"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_socket_candidate_is_skipped() {
+        let resolution = select_ydotool_socket(
+            None,
+            &[
+                candidate(
+                    "/run/user/1000/.ydotool_socket",
+                    Some(YdotoolSocketMeta {
+                        is_socket: false,
+                        mode: 0o644,
+                        uid: current_euid(),
+                        gid: current_egid(),
+                    }),
+                ),
+                accessible_socket("/tmp/.ydotool_socket"),
+            ],
+        );
+
+        assert_eq!(
+            resolution.selection,
+            YdotoolSocketSelection::Inject("/tmp/.ydotool_socket".to_string())
+        );
+        let notes = resolution.checked.join("; ");
+        assert!(notes.contains("/run/user/1000/.ydotool_socket: not a socket"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn group_writable_socket_is_accessible_and_foreign_owner_socket_is_not() {
+        let euid = current_euid();
+        assert_ne!(euid, 0, "this fixture assumes a non-root desktop user");
+        let egid = current_egid();
+        let groups = supplementary_group_ids();
+        let gid = groups
+            .iter()
+            .copied()
+            .find(|gid| *gid != egid)
+            .or_else(|| groups.first().copied())
+            .expect("process should have a supplementary group");
+        let other_uid = euid.wrapping_add(1);
+
+        let group_socket = select_ydotool_socket(
+            None,
+            &[candidate(
+                "/tmp/.ydotool_socket",
+                Some(YdotoolSocketMeta {
+                    is_socket: true,
+                    mode: 0o660,
+                    uid: other_uid,
+                    gid,
+                }),
+            )],
+        );
+        assert_eq!(
+            group_socket.selection,
+            YdotoolSocketSelection::Inject("/tmp/.ydotool_socket".to_string())
+        );
+
+        let foreign_socket = select_ydotool_socket(
+            None,
+            &[candidate(
+                "/tmp/.ydotool_socket",
+                Some(YdotoolSocketMeta {
+                    is_socket: true,
+                    mode: 0o600,
+                    uid: other_uid,
+                    gid,
+                }),
+            )],
+        );
+        assert_eq!(
+            foreign_socket.selection,
+            YdotoolSocketSelection::ClientDefault
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn other_write_does_not_apply_to_a_caller_in_the_socket_group() {
+        let euid = current_euid();
+        assert_ne!(euid, 0, "this fixture assumes a non-root desktop user");
+        let egid = current_egid();
+        let groups = supplementary_group_ids();
+        let other_uid = euid.wrapping_add(1);
+        // Mode 0606: the group class has no write. connect() uses only that
+        // class for egid or a supplementary group, so this socket must not
+        // hide a later one.
+        let mut member_gids = vec![egid];
+        member_gids.extend(groups.iter().copied());
+        for gid in member_gids {
+            let grouped = select_ydotool_socket(
+                None,
+                &[
+                    candidate(
+                        "/tmp/.ydotool_socket",
+                        Some(YdotoolSocketMeta {
+                            is_socket: true,
+                            mode: 0o606,
+                            uid: other_uid,
+                            gid,
+                        }),
+                    ),
+                    accessible_socket("/run/user/1000/.ydotool_socket"),
+                ],
+            );
+            assert_eq!(
+                grouped.selection,
+                YdotoolSocketSelection::Inject("/run/user/1000/.ydotool_socket".to_string()),
+                "mode 0606 must not be writable for group {}",
+                gid
+            );
+            assert!(
+                grouped.checked.join("; ").contains("is not writable"),
+                "group {}",
+                gid
+            );
+        }
+
+        let outsider_gid = (0..u32::MAX)
+            .find(|gid| *gid != egid && !groups.contains(gid))
+            .expect("a gid outside the process groups");
+        let outsider = select_ydotool_socket(
+            None,
+            &[candidate(
+                "/tmp/.ydotool_socket",
+                Some(YdotoolSocketMeta {
+                    is_socket: true,
+                    mode: 0o606,
+                    uid: other_uid,
+                    gid: outsider_gid,
+                }),
+            )],
+        );
+        assert_eq!(
+            outsider.selection,
+            YdotoolSocketSelection::Inject("/tmp/.ydotool_socket".to_string())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn blank_ydotool_socket_falls_through_to_candidate_search() {
+        for inherited in ["", "   ", "\t\n"] {
+            let resolution = select_ydotool_socket(
+                Some(inherited),
+                &[
+                    candidate("/run/user/1000/.ydotool_socket", None),
+                    accessible_socket("/tmp/.ydotool_socket"),
+                ],
+            );
+            assert_eq!(
+                resolution.selection,
+                YdotoolSocketSelection::Inject("/tmp/.ydotool_socket".to_string()),
+                "inherited value {:?}",
+                inherited
+            );
+            let mut command = Command::new("ydotool");
+            configure_ydotool_socket(&mut command, &resolution);
+            assert_eq!(
+                child_socket(&command),
+                Some(std::ffi::OsStr::new("/tmp/.ydotool_socket")),
+                "inherited value {:?}",
+                inherited
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn blank_ydotool_socket_is_cleared_when_the_client_default_is_used() {
+        for inherited in ["", "   ", "\t\n"] {
+            let resolution = select_ydotool_socket(
+                Some(inherited),
+                &[
+                    candidate("/run/user/1000/.ydotool_socket", None),
+                    candidate("/tmp/.ydotool_socket", None),
+                ],
+            );
+            assert_eq!(
+                resolution.selection,
+                YdotoolSocketSelection::ClientDefault,
+                "inherited value {:?}",
+                inherited
+            );
+            let mut command = Command::new("ydotool");
+            configure_ydotool_socket(&mut command, &resolution);
+            assert!(
+                ydotool_socket_was_removed(&command),
+                "blank YDOTOOL_SOCKET {:?} must be removed so ydotool uses its client default",
+                inherited
+            );
+            let failure = format_ydotool_failure("", "", Some(2), &resolution);
+            assert!(
+                failure.contains("YDOTOOL_SOCKET left unset"),
+                "inherited value {:?}",
+                inherited
+            );
+        }
     }
 
     #[test]
